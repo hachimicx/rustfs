@@ -74,12 +74,22 @@ jobs:
         uses: vmactions/freebsd-vm@v1
         with:
           release: '14'
+          mem: 12288
           envs: 'VERSION'
           prepare: |
             pkg install -y rust cmake perl5 zip pkgconf git
           run: |
             set -eu
             echo "building on $(freebsd-version) with $(rustc --version)"
+            df -h
+
+            # 8G swap file: thin-LTO linking of the rustfs binary peaks several GB
+            if ! swapctl -l 2>/dev/null | grep -q swapfile; then
+              dd if=/dev/zero of=/swapfile bs=$((1024*1024)) count=8192
+              chmod 0600 /swapfile
+              swapon /swapfile
+            fi
+            swapctl -l
 
             # MSRV check from workspace Cargo.toml; fall back to rustup if pkg rust is older
             NEED=$(awk -F'"' '/^rust-version/ {print $2; exit}' Cargo.toml)
@@ -93,11 +103,13 @@ jobs:
               echo "now using $(rustc --version)"
             fi
 
-            export CARGO_TARGET_DIR=/tmp/rustfs-target
-            cargo build --release -p rustfs
+            # -j 2: cap parallel rustc/ld to keep peak memory within VM RAM + swap
+            export CARGO_TARGET_DIR="$HOME/rustfs-target"
+            export CARGO_INCREMENTAL=0
+            cargo build --release -p rustfs -j 2
 
             mkdir -p build
-            cp /tmp/rustfs-target/release/rustfs build/rustfs-freebsd-amd64
+            cp "$HOME/rustfs-target/release/rustfs" build/rustfs-freebsd-amd64
             chmod +x build/rustfs-freebsd-amd64
             file build/rustfs-freebsd-amd64
             ls -lh build/

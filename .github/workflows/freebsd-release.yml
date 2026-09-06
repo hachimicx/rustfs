@@ -83,12 +83,12 @@ jobs:
             echo "building on $(freebsd-version) with $(rustc --version)"
             df -h
 
-            # 8G swap file: thin-LTO linking of the rustfs binary peaks several GB
-            if ! swapctl -l 2>/dev/null | grep -q swapfile; then
-              dd if=/dev/zero of=/swapfile bs=$((1024*1024)) count=8192
-              chmod 0600 /swapfile
-              swapon /swapfile
-            fi
+            # 8G swap: thin-LTO linking of the rustfs binary peaks several GB.
+            # FreeBSD swapon needs a block device -> md vnode backed by the file.
+            dd if=/dev/zero of=/swapfile bs=1m count=8192
+            chmod 0600 /swapfile
+            MD=$(mdconfig -a -t vnode -f /swapfile)
+            swapon "/dev/$MD"
             swapctl -l
 
             # MSRV check from workspace Cargo.toml; fall back to rustup if pkg rust is older

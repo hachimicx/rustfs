@@ -1,0 +1,141 @@
+name: freebsd-release
+
+on:
+  schedule:
+    - cron: '30 3 * * *'   # daily 03:30 UTC: watch upstream tags
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'upstream tag/branch to build (empty = latest upstream release tag)'
+        required: false
+        default: ''
+      force:
+        description: 'build even if a release already exists'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Resolve upstream latest tag
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+          REF_IN: ${{ inputs.ref }}
+        run: |
+          if [ -n "$REF_IN" ]; then
+            TAG="$REF_IN"
+          else
+            TAG=$(gh api 'repos/rustfs/rustfs/releases?per_page=1' --jq '.[0].tag_name')
+          fi
+          echo "upstream tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # idempotency: skip if we already published this tag on the fork
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$TAG" > /dev/null 2>&1; then
+            echo "release $TAG already exists -> skip"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release $TAG missing -> build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      VERSION: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Checkout rustfs/rustfs
+        uses: actions/checkout@v7
+        with:
+          repository: rustfs/rustfs
+          ref: ${{ needs.check.outputs.tag }}
+          persist-credentials: false
+
+      - name: Build in FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14'
+          envs: 'VERSION'
+          prepare: |
+            pkg install -y rust cmake perl5 zip pkgconf git
+          run: |
+            set -eu
+            echo "building on $(freebsd-version) with $(rustc --version)"
+
+            # MSRV check from workspace Cargo.toml; fall back to rustup if pkg rust is older
+            NEED=$(awk -F'"' '/^rust-version/ {print $2; exit}' Cargo.toml)
+            HAVE=$(rustc --version | awk '{print $2}')
+            echo "MSRV=${NEED} have=${HAVE}"
+            if [ "$(printf '%s\n' "$NEED" "$HAVE" | sort -V | head -1)" != "$NEED" ]; then
+              echo "pkg rust too old -> installing stable via rustup"
+              fetch https://sh.rustup.rs -o /tmp/rustup.sh
+              sh /tmp/rustup.sh -y --profile minimal --default-toolchain stable
+              export PATH="$HOME/.cargo/bin:$PATH"
+              echo "now using $(rustc --version)"
+            fi
+
+            export CARGO_TARGET_DIR=/tmp/rustfs-target
+            cargo build --release -p rustfs
+
+            mkdir -p build
+            cp /tmp/rustfs-target/release/rustfs build/rustfs-freebsd-amd64
+            chmod +x build/rustfs-freebsd-amd64
+            file build/rustfs-freebsd-amd64
+            ls -lh build/
+            (timeout 20 ./build/rustfs-freebsd-amd64 --version || true) | head -3
+
+            zip -j "build/rustfs-freebsd-amd64-${VERSION}.zip" build/rustfs-freebsd-amd64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustfs-freebsd-amd64-${{ needs.check.outputs.tag }}
+          path: build/rustfs-freebsd-amd64-${{ needs.check.outputs.tag }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rustfs-freebsd-amd64-${{ needs.check.outputs.tag }}
+          path: dist
+
+      - name: Create release
+        run: |
+          ls -lh dist/
+          SHA=$(gh api "repos/rustfs/rustfs/git/ref/tags/$TAG" --jq '.object.sha' || echo unknown)
+          gh release create "$TAG" dist/*.zip \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "rustfs $TAG (FreeBSD amd64)" \
+            --notes "Unofficial FreeBSD 14.4 (amd64) build of rustfs [$TAG](https://github.com/rustfs/rustfs/releases/tag/$TAG) (upstream commit $SHA).
+
+          Built with the Rust toolchain from the freebsd-release workflow in this fork.
+          For amd64: unzip, chmod +x rustfs-freebsd-amd64, run. Requires FreeBSD 13+ (built on 14.4)."
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
